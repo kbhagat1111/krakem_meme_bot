@@ -1,10 +1,11 @@
 import ccxt
+import os
 import time
 
-# Connect to Kraken API
+# Connect to Kraken API using Heroku Config Vars
 kraken = ccxt.kraken({
-    'apiKey': 'YOUR_API_KEY',
-    'secret': 'YOUR_API_SECRET'
+    'apiKey': os.environ['KRAKEN_API_KEY'],
+    'secret': os.environ['KRAKEN_API_SECRET']
 })
 
 # Config
@@ -36,8 +37,8 @@ def trade_cycle():
         if coin_balance > 0 and base in buy_prices:
             buy_price = buy_prices[base]
             if (last_price - buy_price) * coin_balance >= MIN_PROFIT:
-                kraken.create_market_sell_order(symbol, coin_balance)
-                log(f"Sold {coin_balance} of {base} at {last_price} for profit.")
+              kraken.create_market_sell_order(symbol, coin_balance)
+                log(f"Sold {coin_balance:.5f} {base} at {last_price} for profit.")
                 del buy_prices[base]
         elif get_balance('USD') >= 1:
             usd_to_spend = USD_BALANCE / len(TRADING_SYMBOLS)
