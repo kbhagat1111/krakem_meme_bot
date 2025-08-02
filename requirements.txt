@@ -1,3 +1,4 @@
+pykrakenapi
 python-dotenv
 krakenex
 requests
