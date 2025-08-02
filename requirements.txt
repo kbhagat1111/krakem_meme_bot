@@ -1,6 +1,2 @@
-pykrakenapi
-python-dotenv
 krakenex
-requests
-pandas
-numpy
+pykrakenapi
