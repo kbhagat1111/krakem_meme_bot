@@ -1,2 +1,2 @@
-krakenex
-pykrakenapi
+ccxt
+redis
