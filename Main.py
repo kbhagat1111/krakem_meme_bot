@@ -10,7 +10,10 @@ LOOP_DELAY = 6  # seconds between checks
 
 # === KRAKEN API ===
 api = krakenex.API()
-api.load_key('kraken.key')
+import os
+api_key = os.getenv("KRAKEN_API_KEY")
+api_secret = os.getenv("KRAKEN_API_SECRET")
+api = krakenex.API(api_key, api_secret)
 
 # === LOGGING ===
 def log(msg):
