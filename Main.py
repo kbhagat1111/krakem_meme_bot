@@ -1,163 +1,117 @@
-import os
+import krakenex
 import time
-from datetime import datetime
-from krakenex import API
-from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timezone
 
-# ===============================
-# CONFIG
-# ===============================
-TARGET_PROFIT = Decimal("0.05")  # Minimum profit after fees
-STOP_LOSS_PERCENT = Decimal("-3.0")  # % loss before selling
-STOP_LOSS_HOURS = 2  # Minimum hold before stop-loss can trigger
-TRADE_AMOUNT_USD = Decimal("5.00")  # Amount per trade
-SCAN_INTERVAL = 10  # Seconds between scans
+# === CONFIGURATION ===
+PAIR_LIST = ["SHIB/USD", "DOGE/USD", "PEPE/USD", "BONK/USD", "FLOKI/USD"]  # Meme coins
+SELL_PROFIT_TARGET = 0.15  # USD profit target after fees
+TRADE_AMOUNT_USD = 5  # Amount per trade
+LOOP_DELAY = 6  # seconds between checks
 
-# Kraken API
-kraken = API(
-    key=os.getenv("KRAKEN_API_KEY"),
-    secret=os.getenv("KRAKEN_API_SECRET")
-)
+# === KRAKEN API ===
+api = krakenex.API()
+api.load_key('kraken.key')
 
-portfolio = {}
-restricted_coins = set()
-
+# === LOGGING ===
 def log(msg):
-    print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
-# ===============================
-# CHECK FOR RESTRICTED COINS
-# ===============================
-def is_coin_restricted(pair):
-    if pair in restricted_coins:
-        return True
-    try:
-        order_test = kraken.query_private('AddOrder', {
-            'pair': pair,
-            'type': 'buy',
-            'ordertype': 'market',
-            'volume': '0.00001'
-        })
-        if 'error' in order_test and any("restricted" in e.lower() for e in order_test['error']):
-            restricted_coins.add(pair)
-            log(f"Restricted detected: {pair} — skipping")
-            return True
-    except Exception as e:
-        if "restricted" in str(e).lower():
-            restricted_coins.add(pair)
-            log(f"Restricted detected: {pair} — skipping")
-            return True
-    return False
-
-# ===============================
-# GET MARKET PRICE
-# ===============================
+# === MARKET PRICE ===
 def get_price(pair):
     try:
-        data = kraken.query_public('Ticker', {'pair': pair})
-        price = Decimal(data['result'][list(data['result'].keys())[0]]['c'][0])
-        return price
+        resp = api.query_public('Ticker', {'pair': pair})
+        return float(list(resp['result'].values())[0]['c'][0])
     except Exception as e:
-        log(f"Price fetch failed for {pair}: {e}")
+        log(f"Error getting price for {pair}: {e}")
         return None
 
-# ===============================
-# PLACE BUY ORDER
-# ===============================
-def execute_buy(pair, usd_amount):
-    price = get_price(pair)
-    if not price:
-        return False
-    volume = (usd_amount / price).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+# === BALANCES ===
+def get_balance():
     try:
-        order = kraken.query_private('AddOrder', {
-            'pair': pair,
-            'type': 'buy',
-            'ordertype': 'market',
-            'volume': str(volume)
-        })
-        if 'error' in order and order['error']:
-            log(f"Buy failed for {pair}: {order['error']}")
-            return False
-        portfolio[pair] = {
-            'buy_price': price,
-            'buy_time': datetime.utcnow(),
-            'amount': volume
-        }
-        log(f"Bought {volume} {pair} @ ${price}")
-        return True
+        resp = api.query_private('Balance')
+        return resp['result']
     except Exception as e:
-        log(f"Buy order error for {pair}: {e}")
-        return False
+        log(f"Error fetching balance: {e}")
+        return {}
 
-# ===============================
-# PLACE SELL ORDER
-# ===============================
-def execute_sell(pair, amount):
+# === SELL COIN ===
+def sell_coin(pair, volume):
     try:
-        order = kraken.query_private('AddOrder', {
+        resp = api.query_private('AddOrder', {
             'pair': pair,
             'type': 'sell',
             'ordertype': 'market',
-            'volume': str(amount)
+            'volume': volume
         })
-        if 'error' in order and order['error']:
-            log(f"Sell failed for {pair}: {order['error']}")
-            return False
-        log(f"Sold {amount} {pair}")
-        portfolio.pop(pair, None)
-        return True
+        if 'error' in resp and resp['error']:
+            log(f"Sell failed for {pair}: {resp['error']}")
+        else:
+            log(f"Sold {volume} {pair}")
     except Exception as e:
-        log(f"Sell order error for {pair}: {e}")
-        return False
+        log(f"Error selling {pair}: {e}")
 
-# ===============================
-# SELL DECISION
-# ===============================
-def should_sell(pair, buy_price, current_price, buy_time):
-    net_profit = (current_price - buy_price) * portfolio[pair]['amount']
-    hold_time_hours = (datetime.utcnow() - buy_time).total_seconds() / 3600
-
-    if net_profit >= TARGET_PROFIT:
-        return True, f"Target profit reached: ${net_profit:.4f}"
-    if hold_time_hours >= STOP_LOSS_HOURS:
-        pct_change = ((current_price - buy_price) / buy_price) * 100
-        if pct_change <= STOP_LOSS_PERCENT:
-            return True, f"Stop-loss triggered: {pct_change:.2f}%"
-    return False, f"Holding — Profit ${net_profit:.4f}"
-
-# ===============================
-# GET MEME COINS LIST
-# ===============================
-def get_meme_coins():
-    return ["SHIB/USD", "DOGE/USD", "PEPE/USD", "BONK/USD", "FLOKI/USD"]
-
-# ===============================
-# MAIN LOOP
-# ===============================
-while True:
+# === BUY COIN ===
+def buy_coin(pair, usd_amount):
+    price = get_price(pair)
+    if price is None:
+        return
+    volume = round(usd_amount / price, 0 if "USD" in pair else 8)
     try:
-        for coin in get_meme_coins():
-            if is_coin_restricted(coin):
-                continue
-
-            price = get_price(coin)
-            if not price:
-                continue
-
-            if coin in portfolio:
-                buy_price = portfolio[coin]['buy_price']
-                buy_time = portfolio[coin]['buy_time']
-                sell, reason = should_sell(coin, buy_price, price, buy_time)
-                if sell:
-                    execute_sell(coin, portfolio[coin]['amount'])
-                else:
-                    log(f"{coin}: {reason}")
-            else:
-                execute_buy(coin, TRADE_AMOUNT_USD)
-
-        time.sleep(SCAN_INTERVAL)
-
+        resp = api.query_private('AddOrder', {
+            'pair': pair,
+            'type': 'buy',
+            'ordertype': 'market',
+            'volume': volume
+        })
+        if 'error' in resp and resp['error']:
+            log(f"Buy failed for {pair}: {resp['error']}")
+        else:
+            log(f"Bought {volume} of {pair}")
     except Exception as e:
-        log(f"Main loop error: {e}")
-        time.sleep(5)
+        log(f"Error buying {pair}: {e}")
+
+# === CHECK AND SELL CURRENT HOLDINGS ON STARTUP ===
+def clear_positions():
+    balances = get_balance()
+    for pair in PAIR_LIST:
+        base = pair.split('/')[0]  # e.g., "SHIB"
+        if base in balances and float(balances[base]) > 0:
+            sell_coin(pair, balances[base])
+            time.sleep(2)  # avoid API rate limit
+
+# === MAIN LOOP ===
+def main():
+    log("Starting bot - Clearing existing positions...")
+    clear_positions()
+    log("Positions cleared. Starting trading...")
+
+    bought_prices = {}
+
+    while True:
+        balances = get_balance()
+        usd_balance = float(balances.get("ZUSD", 0))
+
+        # SELL if target profit reached
+        for pair in list(bought_prices.keys()):
+            base = pair.split('/')[0]
+            if base in balances and float(balances[base]) > 0:
+                current_price = get_price(pair)
+                buy_price = bought_prices[pair]
+                profit = (current_price - buy_price) * float(balances[base])
+                if profit >= SELL_PROFIT_TARGET:
+                    sell_coin(pair, balances[base])
+                    del bought_prices[pair]
+                    time.sleep(2)
+
+        # BUY new coins if we have USD
+        if usd_balance >= TRADE_AMOUNT_USD:
+            for pair in PAIR_LIST:
+                if pair not in bought_prices:
+                    buy_coin(pair, TRADE_AMOUNT_USD)
+                    bought_prices[pair] = get_price(pair)
+                    time.sleep(2)
+
+        time.sleep(LOOP_DELAY)
+
+if __name__ == "__main__":
+    main()
