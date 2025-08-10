@@ -1,120 +1,162 @@
-import krakenex
-import time
-from datetime import datetime, timezone
-
-# === CONFIGURATION ===
-PAIR_LIST = ["SHIB/USD", "DOGE/USD", "PEPE/USD", "BONK/USD", "FLOKI/USD"]  # Meme coins
-SELL_PROFIT_TARGET = 0.15  # USD profit target after fees
-TRADE_AMOUNT_USD = 5  # Amount per trade
-LOOP_DELAY = 6  # seconds between checks
-
-# === KRAKEN API ===
-api = krakenex.API()
 import os
+import time
+import krakenex
+
+# API Keys from Heroku Config Vars
 api_key = os.getenv("KRAKEN_API_KEY")
 api_secret = os.getenv("KRAKEN_API_SECRET")
+if not api_key or not api_secret:
+    raise ValueError("Missing Kraken API keys in Heroku Config Vars")
+
 api = krakenex.API(api_key, api_secret)
 
-# === LOGGING ===
-def log(msg):
-    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
+# Constants
+FEE_RATE = 0.0026       # Kraken fee ~0.26%
+TARGET_PROFIT = 0.15    # USD profit target after fees
+STOP_LOSS = 0.05        # Sell if price drops more than 5% from buy price
+SIDEWAYS_LIMIT = 600    # 10 minutes in seconds
+SIDEWAYS_THRESHOLD = 0.01  # ±1% price range counts as "sideways"
+SLEEP_INTERVAL = 5
+MEME_COINS = ["SHIBUSD", "DOGEUSD", "PEPEUSD", "BONKUSD", "FLOKIUSD"]
 
-# === MARKET PRICE ===
-def get_price(pair):
-    try:
-        resp = api.query_public('Ticker', {'pair': pair})
-        return float(list(resp['result'].values())[0]['c'][0])
-    except Exception as e:
-        log(f"Error getting price for {pair}: {e}")
-        return None
-
-# === BALANCES ===
-def get_balance():
-    try:
-        resp = api.query_private('Balance')
-        return resp['result']
-    except Exception as e:
-        log(f"Error fetching balance: {e}")
+# --- Helpers ---
+def get_balances():
+    res = api.query_private('Balance')
+    if res.get("error"):
+        print("Balance Error:", res["error"])
         return {}
+    return {asset: float(amount) for asset, amount in res['result'].items() if float(amount) > 0}
 
-# === SELL COIN ===
-def sell_coin(pair, volume):
-    try:
-        resp = api.query_private('AddOrder', {
-            'pair': pair,
-            'type': 'sell',
-            'ordertype': 'market',
-            'volume': volume
-        })
-        if 'error' in resp and resp['error']:
-            log(f"Sell failed for {pair}: {resp['error']}")
-        else:
-            log(f"Sold {volume} {pair}")
-    except Exception as e:
-        log(f"Error selling {pair}: {e}")
+def sell_all_except_usd():
+    balances = get_balances()
+    for asset, amount in balances.items():
+        if asset != "ZUSD":
+            if asset.startswith("X") or asset.startswith("Z"):
+                pair = asset[1:] + "USD"
+            else:
+                pair = asset + "USD"
+            pair = pair.replace("XBT", "BTC")
+            try:
+                print(f"Selling {amount} {asset}...")
+                api.query_private('AddOrder', {
+                    'pair': pair,
+                    'type': 'sell',
+                    'ordertype': 'market',
+                    'volume': amount
+                })
+            except Exception as e:
+                print(f"Error selling {asset}: {e}")
 
-# === BUY COIN ===
+def get_price(pair):
+    res = api.query_public('Ticker', {'pair': pair})
+    if res.get("error"):
+        print("Price Error:", res["error"])
+        return None
+    return float(list(res['result'].values())[0]['c'][0])
+
 def buy_coin(pair, usd_amount):
     price = get_price(pair)
-    if price is None:
+    if not price:
+        return None
+    volume = usd_amount / price
+    api.query_private('AddOrder', {
+        'pair': pair,
+        'type': 'buy',
+        'ordertype': 'market',
+        'volume': volume
+    })
+    print(f"Bought {pair} at {price} with ${usd_amount}")
+    return price
+
+def trade_coin(pair, usd_amount):
+    buy_price = buy_coin(pair, usd_amount)
+    if not buy_price:
         return
-    volume = round(usd_amount / price, 0 if "USD" in pair else 8)
-    try:
-        resp = api.query_private('AddOrder', {
-            'pair': pair,
-            'type': 'buy',
-            'ordertype': 'market',
-            'volume': volume
-        })
-        if 'error' in resp and resp['error']:
-            log(f"Buy failed for {pair}: {resp['error']}")
-        else:
-            log(f"Bought {volume} of {pair}")
-    except Exception as e:
-        log(f"Error buying {pair}: {e}")
+    target_price = buy_price * (1 + TARGET_PROFIT)
+    stop_price = buy_price * (1 - STOP_LOSS)
+    sideways_low = buy_price * (1 - SIDEWAYS_THRESHOLD)
+    sideways_high = buy_price * (1 + SIDEWAYS_THRESHOLD)
 
-# === CHECK AND SELL CURRENT HOLDINGS ON STARTUP ===
-def clear_positions():
-    balances = get_balance()
-    for pair in PAIR_LIST:
-        base = pair.split('/')[0]  # e.g., "SHIB"
-        if base in balances and float(balances[base]) > 0:
-            sell_coin(pair, balances[base])
-            time.sleep(2)  # avoid API rate limit
-
-# === MAIN LOOP ===
-def main():
-    log("Starting bot - Clearing existing positions...")
-    clear_positions()
-    log("Positions cleared. Starting trading...")
-
-    bought_prices = {}
+    start_time = time.time()
 
     while True:
-        balances = get_balance()
-        usd_balance = float(balances.get("ZUSD", 0))
+        price = get_price(pair)
+        if not price:
+            time.sleep(SLEEP_INTERVAL)
+            continue
 
-        # SELL if target profit reached
-        for pair in list(bought_prices.keys()):
-            base = pair.split('/')[0]
-            if base in balances and float(balances[base]) > 0:
-                current_price = get_price(pair)
-                buy_price = bought_prices[pair]
-                profit = (current_price - buy_price) * float(balances[base])
-                if profit >= SELL_PROFIT_TARGET:
-                    sell_coin(pair, balances[base])
-                    del bought_prices[pair]
-                    time.sleep(2)
+        # Take profit
+        if price >= target_price:
+            balances = get_balances()
+            asset_symbol = pair.replace("USD", "")
+            vol = balances.get(asset_symbol, 0)
+            if vol > 0:
+                api.query_private('AddOrder', {
+                    'pair': pair,
+                    'type': 'sell',
+                    'ordertype': 'market',
+                    'volume': vol
+                })
+                print(f"✅ Sold {pair} at {price} for profit.")
+            break
 
-        # BUY new coins if we have USD
-        if usd_balance >= TRADE_AMOUNT_USD:
-            for pair in PAIR_LIST:
-                if pair not in bought_prices:
-                    buy_coin(pair, TRADE_AMOUNT_USD)
-                    bought_prices[pair] = get_price(pair)
-                    time.sleep(2)
+        # Stop-loss
+        if price <= stop_price:
+            balances = get_balances()
+            asset_symbol = pair.replace("USD", "")
+            vol = balances.get(asset_symbol, 0)
+            if vol > 0:
+                api.query_private('AddOrder', {
+                    'pair': pair,
+                    'type': 'sell',
+                    'ordertype': 'market',
+                    'volume': vol
+                })
+                print(f"⚠️ Stop-loss triggered for {pair}, sold at {price}")
+            break
 
-        time.sleep(LOOP_DELAY)
+        # Sideways trading timeout
+        if sideways_low <= price <= sideways_high and (time.time() - start_time) >= SIDEWAYS_LIMIT:
+            balances = get_balances()
+            asset_symbol = pair.replace("USD", "")
+            vol = balances.get(asset_symbol, 0)
+            if vol > 0:
+                api.query_private('AddOrder', {
+                    'pair': pair,
+                    'type': 'sell',
+                    'ordertype': 'market',
+                    'volume': vol
+                })
+                print(f"⏳ Sideways timeout: Sold {pair} at {price} after {SIDEWAYS_LIMIT} seconds of no movement.")
+            break
 
+        time.sleep(SLEEP_INTERVAL)
+
+# --- Main loop ---
 if __name__ == "__main__":
-    main()
+    print("Starting perpetual trading bot with 70-30 split, stop-loss, and sideways timeout...")
+
+    while True:
+        print("Selling all current coins to free funds...")
+        sell_all_except_usd()
+        time.sleep(5)
+
+        balances = get_balances()
+        usd_balance = balances.get("ZUSD", 0)
+        if usd_balance <= 0:
+            print("No USD available for trading. Retrying...")
+            time.sleep(30)
+            continue
+
+        invest_amount = usd_balance * 0.70
+        reserve_amount = usd_balance * 0.30
+
+        print(f"Total USD: ${usd_balance:.2f} | Invest: ${invest_amount:.2f} | Reserve: ${reserve_amount:.2f}")
+
+        per_coin_investment = invest_amount / len(MEME_COINS)
+
+        for coin in MEME_COINS:
+            trade_coin(coin, per_coin_investment)
+
+        print("Cycle complete. Restarting cycle...")
+        time.sleep(5)
