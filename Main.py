@@ -1,10 +1,10 @@
- # main.py
+# main.py
 # Kraken scalper (ccxt)
 # - Auto-sell on start
 # - Buy on >=4% dip + momentum (2 recent green candles & shortMA > longMA)
 # - Sell on net +4% after estimated fees OR reversal (2 red candles + drop)
 # - 70% reinvest / 30% reserve saved in memory
-# - Trades both crypto and ETFs using same funds
+# - Min-order-size checks to avoid "volume minimum not met"
 #
 # WARNING: This script places real orders. Test with small funds first.
 
@@ -13,7 +13,7 @@ import time
 import math
 import ccxt
 from datetime import datetime, timedelta
-from collections import deque
+from collections import defaultdict, deque
 
 # ---------------- CONFIG (override with Heroku env vars) ----------------
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "30"))
@@ -293,11 +293,7 @@ def main_loop():
 
             total_usd = get_total_usd()
             tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - reserve_usd)
-            log(
-                f"[POOL] Total USD ${total_usd:.2f} | "
-                f"Tradeable ${tradeable_pool:.2f} | "
-                f"Reserve(mem) ${reserve_usd:.2f}"
-            )
+            log(f"[POOL] Total USD ${total_usd:.2f} | Tradeable ${tradeable_pool:.2f} | Reserve(mem) ${reserve_usd:.2f}")
 
             # build candidate list: all /USD pairs filtered out restricted pairs and stablecoins
             candidates = []
@@ -333,7 +329,7 @@ def main_loop():
                     gross = (price - bprice) * amt
                     fees = (price * amt + bprice * amt) * FEE_EST
                     net_usd = gross - fees
-                    net_pct_after = net_pct_after_fees(bprice, price)
+                    net_pct = net_pct_after = net_pct_after_fees(bprice, price)
                 else:
                     net_pct_after = None
 
@@ -364,9 +360,11 @@ def main_loop():
                     continue
 
                 # reversal-based sell: if last 2 closes red AND price dropped >= REVERSAL_DROP_PCT since recent local peak after buy
+                # use last 3 closes
                 closes = last_n_closes(pair, 3)
                 if closes and len(closes) >= 3:
                     if closes[-1] < closes[-2] < closes[-3]:
+                        # get peak since buy (approx using recent_peak)
                         peak = recent_peak(pair, minutes=30)
                         if peak and (peak - price) / peak >= REVERSAL_DROP_PCT:
                             log(f"[SELL-REVERSAL] {base} reversal detected -> SELL (peak={peak:.8f} now={price:.8f})")
@@ -390,14 +388,82 @@ def main_loop():
             # refresh pool after sells
             total_usd = get_total_usd()
             tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - reserve_usd)
-            log(
-                f"[AFTER SELL] Total USD ${total_usd:.2f} | "
-                f"Tradeable ${tradeable_pool:.2f} | "
-                f"Reserve(mem) ${reserve_usd:.2f}"
-            )
+            log(f"[AFTER SELL] Total USD ${total_usd:.2f} | Tradeable ${tradeable_pool:.2f} | Reserve(mem) ${reserve_usd:.2f}")
 
             # ensure tradeable funds available
             if tradeable_pool < MIN_TRADE_USD:
                 ok = ensure_tradeable(MIN_TRADE_USD * 2)
                 total_usd = get_total_usd()
-               
+                tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - reserve_usd)
+                if not ok:
+                    log("[WAIT] cannot free funds this loop; skipping buys")
+
+            # BUY PHASE: attempt up to MAX_BUYS_PER_LOOP buys
+            buys = 0
+            current_positions = sum(1 for b in buy_price.keys() if get_base_bal(b) > 0)
+            free_slots = max(0, MAX_CONCURRENT_POS - current_positions)
+            if free_slots <= 0:
+                log("[BUY] max concurrent positions reached")
+            else:
+                per_buy = max(MIN_TRADE_USD, tradeable_pool / max(1, free_slots))
+                # iterate candidates (simple order: random-ish order by pair name) and attempt buys
+                for pair in candidates:
+                    if buys >= MAX_BUYS_PER_LOOP:
+                        break
+                    if tradeable_pool < MIN_TRADE_USD:
+                        break
+                    price = fetch_price(pair)
+                    if price is None:
+                        continue
+                    base = pair.split('/')[0]
+                    # skip if already holding
+                    if get_base_bal(base) > 0:
+                        continue
+                    # skip cooldown
+                    if cooldown_until.get(base) and cooldown_until[base] > now():
+                        continue
+                    # liquidity and spread checks
+                    if not volume_ok(pair):
+                        continue
+                    if not spread_ok(pair):
+                        continue
+                    # dip test: at least DIP_PCT from recent peak
+                    peak = recent_peak(pair, minutes=15)
+                    if not peak:
+                        continue
+                    dip = (peak - price) / peak
+                    if dip < DIP_PCT:
+                        continue
+                    # momentum: last 2 candles green + short_ma > long_ma
+                    closes = last_n_closes(pair, n=3)
+                    if len(closes) < 3:
+                        continue
+                    # last 2 candles green check:
+                    if not (closes[-1] > closes[-2] and closes[-2] > closes[-3]):
+                        continue
+                    if not short_long_momentum(pair, short=SHORT_MA_MIN, long=LONG_MA_MIN):
+                        continue
+                    # allocate and buy
+                    usd_alloc = min(per_buy, tradeable_pool)
+                    if usd_alloc < MIN_TRADE_USD:
+                        break
+                    res = market_buy(pair, usd_alloc)
+                    if res:
+                        p_buy, qty = res
+                        buy_price[base] = p_buy
+                        buy_qty[base] = qty
+                        buy_time[base] = now()
+                        trade_log.append((now().isoformat(), 'BUY', base, p_buy, qty, usd_alloc))
+                        buys += 1
+                        tradeable_pool -= usd_alloc
+                        time.sleep(0.5)
+
+        except Exception as e:
+            log(f"[ERROR] main loop exception: {e}")
+
+        elapsed = time.time() - loop_start
+        to_sleep = max(1, CYCLE_SECONDS - elapsed)
+        time.sleep(to_sleep)
+
+if __name__ == "__main__":
+    main_loop()
