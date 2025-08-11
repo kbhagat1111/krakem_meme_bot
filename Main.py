@@ -1,10 +1,10 @@
-# main.py
+ # main.py
 # Kraken scalper (ccxt)
 # - Auto-sell on start
 # - Buy on >=4% dip + momentum (2 recent green candles & shortMA > longMA)
 # - Sell on net +4% after estimated fees OR reversal (2 red candles + drop)
 # - 70% reinvest / 30% reserve saved in memory
-# - Min-order-size checks to avoid "volume minimum not met"
+# - Trades both crypto and ETFs using same funds
 #
 # WARNING: This script places real orders. Test with small funds first.
 
@@ -35,9 +35,6 @@ MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.03"))
 MAX_BUYS_PER_LOOP = int(os.getenv("MAX_BUYS_PER_LOOP", "2"))
 MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "6"))
 SELL_ALL_ON_START = os.getenv("SELL_ALL_ON_START", "true").lower() in ("1","true","yes")
-
-# Define ETFs you want to trade (comma-separated, uppercase)
-ETF_SYMBOLS = set(os.getenv("ETF_SYMBOLS", "SPY,QQQ,DIA,IWM,ARKK").upper().split(','))
 
 # ---------------- Exchange init ----------------
 API_KEY = os.getenv("KRAKEN_API_KEY")
@@ -249,7 +246,7 @@ def ensure_tradeable(target_usd):
     for pair in exchange.markets:
         if not pair.endswith('/USD'):
             continue
-        base = pair.split('/')[0].upper()
+        base = pair.split('/')[0]
         amt = float(bal.get(base) or 0.0)
         if amt <= 0:
             continue
@@ -296,7 +293,11 @@ def main_loop():
 
             total_usd = get_total_usd()
             tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - reserve_usd)
-            log(f"[POOL] Total USD ${total_usd:.2f} | Tradeable ${tradeable_pool:.2f} | Reserve(mem) ${reserve_usd:.2f}")
+            log(
+                f"[POOL] Total USD ${total_usd:.2f} | "
+                f"Tradeable ${tradeable_pool:.2f} | "
+                f"Reserve(mem) ${reserve_usd:.2f}"
+            )
 
             # build candidate list: all /USD pairs filtered out restricted pairs and stablecoins
             candidates = []
@@ -305,24 +306,23 @@ def main_loop():
                     continue
                 if pair in restricted:
                     continue
-                base = pair.split('/')[0].upper()
-                # exclude obvious stablecoins and USD-pegged (basic filter by symbol)
-                if base in ("USDT","USDC","USD","ZUSD"):
+                base = pair.split('/')[0]
+                # exclude obvious stables and USD-pegged (basic filter by symbol)
+                if base.upper() in ("USDT","USDC","USD","ZUSD"):
                     continue
-                # Include ETFs and cryptos (all except stables)
                 candidates.append(pair)
 
             # SELL PHASE: evaluate held positions
             bal = safe_fetch_balance().get('total', {})
             held = []
             for pair in candidates:
-                base = pair.split('/')[0].upper()
+                base = pair.split('/')[0]
                 amt = float(bal.get(base) or 0.0)
                 if amt <= 0:
                     continue
                 held.append((pair, amt))
             for pair, amt in held:
-                base = pair.split('/')[0].upper()
+                base = pair.split('/')[0]
                 price = fetch_price(pair)
                 if price is None:
                     continue
@@ -390,4 +390,14 @@ def main_loop():
             # refresh pool after sells
             total_usd = get_total_usd()
             tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - reserve_usd)
-            log(f"[AFTER SELL] Total USD ${total_usd:.2f} | Tradeable ${tradeable_pool:.
+            log(
+                f"[AFTER SELL] Total USD ${total_usd:.2f} | "
+                f"Tradeable ${tradeable_pool:.2f} | "
+                f"Reserve(mem) ${reserve_usd:.2f}"
+            )
+
+            # ensure tradeable funds available
+            if tradeable_pool < MIN_TRADE_USD:
+                ok = ensure_tradeable(MIN_TRADE_USD * 2)
+                total_usd = get_total_usd()
+               
