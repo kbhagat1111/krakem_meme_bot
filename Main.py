@@ -13,7 +13,7 @@ import time
 import math
 import ccxt
 from datetime import datetime, timedelta
-from collections import defaultdict, deque
+from collections import deque
 
 # ---------------- CONFIG (override with Heroku env vars) ----------------
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "30"))
@@ -35,6 +35,9 @@ MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.03"))
 MAX_BUYS_PER_LOOP = int(os.getenv("MAX_BUYS_PER_LOOP", "2"))
 MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "6"))
 SELL_ALL_ON_START = os.getenv("SELL_ALL_ON_START", "true").lower() in ("1","true","yes")
+
+# Define ETFs you want to trade (comma-separated, uppercase)
+ETF_SYMBOLS = set(os.getenv("ETF_SYMBOLS", "SPY,QQQ,DIA,IWM,ARKK").upper().split(','))
 
 # ---------------- Exchange init ----------------
 API_KEY = os.getenv("KRAKEN_API_KEY")
@@ -246,7 +249,7 @@ def ensure_tradeable(target_usd):
     for pair in exchange.markets:
         if not pair.endswith('/USD'):
             continue
-        base = pair.split('/')[0]
+        base = pair.split('/')[0].upper()
         amt = float(bal.get(base) or 0.0)
         if amt <= 0:
             continue
@@ -302,23 +305,24 @@ def main_loop():
                     continue
                 if pair in restricted:
                     continue
-                base = pair.split('/')[0]
-                # exclude obvious stables and USD-pegged (basic filter by symbol)
-                if base.upper() in ("USDT","USDC","USD","ZUSD"):
+                base = pair.split('/')[0].upper()
+                # exclude obvious stablecoins and USD-pegged (basic filter by symbol)
+                if base in ("USDT","USDC","USD","ZUSD"):
                     continue
+                # Include ETFs and cryptos (all except stables)
                 candidates.append(pair)
 
             # SELL PHASE: evaluate held positions
             bal = safe_fetch_balance().get('total', {})
             held = []
             for pair in candidates:
-                base = pair.split('/')[0]
+                base = pair.split('/')[0].upper()
                 amt = float(bal.get(base) or 0.0)
                 if amt <= 0:
                     continue
                 held.append((pair, amt))
             for pair, amt in held:
-                base = pair.split('/')[0]
+                base = pair.split('/')[0].upper()
                 price = fetch_price(pair)
                 if price is None:
                     continue
@@ -329,7 +333,7 @@ def main_loop():
                     gross = (price - bprice) * amt
                     fees = (price * amt + bprice * amt) * FEE_EST
                     net_usd = gross - fees
-                    net_pct = net_pct_after = net_pct_after_fees(bprice, price)
+                    net_pct_after = net_pct_after_fees(bprice, price)
                 else:
                     net_pct_after = None
 
@@ -360,11 +364,9 @@ def main_loop():
                     continue
 
                 # reversal-based sell: if last 2 closes red AND price dropped >= REVERSAL_DROP_PCT since recent local peak after buy
-                # use last 3 closes
                 closes = last_n_closes(pair, 3)
                 if closes and len(closes) >= 3:
                     if closes[-1] < closes[-2] < closes[-3]:
-                        # get peak since buy (approx using recent_peak)
                         peak = recent_peak(pair, minutes=30)
                         if peak and (peak - price) / peak >= REVERSAL_DROP_PCT:
                             log(f"[SELL-REVERSAL] {base} reversal detected -> SELL (peak={peak:.8f} now={price:.8f})")
@@ -388,82 +390,4 @@ def main_loop():
             # refresh pool after sells
             total_usd = get_total_usd()
             tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - reserve_usd)
-            log(f"[AFTER SELL] Total USD ${total_usd:.2f} | Tradeable ${tradeable_pool:.2f} | Reserve(mem) ${reserve_usd:.2f}")
-
-            # ensure tradeable funds available
-            if tradeable_pool < MIN_TRADE_USD:
-                ok = ensure_tradeable(MIN_TRADE_USD * 2)
-                total_usd = get_total_usd()
-                tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - reserve_usd)
-                if not ok:
-                    log("[WAIT] cannot free funds this loop; skipping buys")
-
-            # BUY PHASE: attempt up to MAX_BUYS_PER_LOOP buys
-            buys = 0
-            current_positions = sum(1 for b in buy_price.keys() if get_base_bal(b) > 0)
-            free_slots = max(0, MAX_CONCURRENT_POS - current_positions)
-            if free_slots <= 0:
-                log("[BUY] max concurrent positions reached")
-            else:
-                per_buy = max(MIN_TRADE_USD, tradeable_pool / max(1, free_slots))
-                # iterate candidates (simple order: random-ish order by pair name) and attempt buys
-                for pair in candidates:
-                    if buys >= MAX_BUYS_PER_LOOP:
-                        break
-                    if tradeable_pool < MIN_TRADE_USD:
-                        break
-                    price = fetch_price(pair)
-                    if price is None:
-                        continue
-                    base = pair.split('/')[0]
-                    # skip if already holding
-                    if get_base_bal(base) > 0:
-                        continue
-                    # skip cooldown
-                    if cooldown_until.get(base) and cooldown_until[base] > now():
-                        continue
-                    # liquidity and spread checks
-                    if not volume_ok(pair):
-                        continue
-                    if not spread_ok(pair):
-                        continue
-                    # dip test: at least DIP_PCT from recent peak
-                    peak = recent_peak(pair, minutes=15)
-                    if not peak:
-                        continue
-                    dip = (peak - price) / peak
-                    if dip < DIP_PCT:
-                        continue
-                    # momentum: last 2 candles green + short_ma > long_ma
-                    closes = last_n_closes(pair, n=3)
-                    if len(closes) < 3:
-                        continue
-                    # last 2 candles green check:
-                    if not (closes[-1] > closes[-2] and closes[-2] > closes[-3]):
-                        continue
-                    if not short_long_momentum(pair, short=SHORT_MA_MIN, long=LONG_MA_MIN):
-                        continue
-                    # allocate and buy
-                    usd_alloc = min(per_buy, tradeable_pool)
-                    if usd_alloc < MIN_TRADE_USD:
-                        break
-                    res = market_buy(pair, usd_alloc)
-                    if res:
-                        p_buy, qty = res
-                        buy_price[base] = p_buy
-                        buy_qty[base] = qty
-                        buy_time[base] = now()
-                        trade_log.append((now().isoformat(), 'BUY', base, p_buy, qty, usd_alloc))
-                        buys += 1
-                        tradeable_pool -= usd_alloc
-                        time.sleep(0.5)
-
-        except Exception as e:
-            log(f"[ERROR] main loop exception: {e}")
-
-        elapsed = time.time() - loop_start
-        to_sleep = max(1, CYCLE_SECONDS - elapsed)
-        time.sleep(to_sleep)
-
-if __name__ == "__main__":
-    main_loop()
+            log(f"[AFTER SELL] Total USD ${total_usd:.2f} | Tradeable ${tradeable_pool:.
