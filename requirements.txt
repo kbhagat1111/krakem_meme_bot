@@ -1,2 +1,4 @@
-ccxt
+pykrakenapi
 krakenex
+pandas
+requests
