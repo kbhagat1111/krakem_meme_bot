@@ -1,4 +1,3 @@
-pykrakenapi
-krakenex
+ccxt
 pandas
 requests
