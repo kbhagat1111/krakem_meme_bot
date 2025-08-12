@@ -1,7 +1,7 @@
 import os
 import time
 import ccxt
-from datetime import datetime
+from datetime import datetime, timezone
 import statistics
 
 # ================== CONFIG ================== #
@@ -25,7 +25,7 @@ exchange.load_markets()
 
 # ---------- Utility Functions ---------- #
 def log(msg):
-    print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
 def get_tradeable_pairs():
     markets = exchange.load_markets()
