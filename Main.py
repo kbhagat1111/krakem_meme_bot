@@ -1,31 +1,27 @@
 # Main.py
 # Kraken scalper (ccxt)
+# - Ensures buys are sized so post-buy qty >= market minimum (so dust doesn't block sells)
+# - Persists in-memory buys + stats to JSON files under /app/data
+# - Combines dust into future buys by taking current base balance into account
+# - 70% reinvest / 30% reserve split
 # - Forever loop
-# - Buy on dip + momentum (4% dip)
-# - Sell at 4% net profit or stop-loss -4% or reversal
-# - 70% reinvest / 30% reserve
-# - Min-order-size checks (skip unsellable dust)
-# - Persistent stats (stats.json) + daily_log.txt
 #
-# WARNING: Real orders. Test with small amounts first.
+# WARNING: This places real market orders. Test with tiny balances first.
 
-import os
-import time
-import json
-import math
+import os, time, json, math, traceback
 import ccxt
 from datetime import datetime, timedelta, timezone
 from collections import deque
 
-# ---------- Config (override with env vars) ----------
+# ---------- Config ----------
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "30"))
-DIP_PCT = float(os.getenv("DIP_PCT", "0.04"))               # 4% dip
+DIP_PCT = float(os.getenv("DIP_PCT", "0.04"))               # buy when price >=4% below recent peak
 SHORT_MA_MIN = int(os.getenv("SHORT_MA_MIN", "3"))
 LONG_MA_MIN = int(os.getenv("LONG_MA_MIN", "15"))
 MIN_TRADE_USD = float(os.getenv("MIN_TRADE_USD", "1.0"))
-TRADEABLE_FRAC = float(os.getenv("TRADEABLE_FRAC", "0.70"))  # 70% tradeable
-RESERVE_FRAC = float(os.getenv("RESERVE_FRAC", "0.30"))      # 30% reserve
-FEE_EST = float(os.getenv("FEE_EST", "0.0026"))              # 0.26% taker approx
+TRADEABLE_FRAC = float(os.getenv("TRADEABLE_FRAC", "0.70"))  # 70% usable
+RESERVE_FRAC = float(os.getenv("RESERVE_FRAC", "0.30"))      # 30% reserve from profits
+FEE_EST = float(os.getenv("FEE_EST", "0.0026"))              # estimate taker fee (0.26%)
 TAKE_PROFIT_NET_PCT = float(os.getenv("TAKE_PROFIT_NET_PCT", "0.04"))  # 4% net
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-0.04"))   # -4% stop loss
 REVERSAL_DROP_PCT = float(os.getenv("REVERSAL_DROP_PCT", "0.015"))
@@ -39,17 +35,16 @@ MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "6"))
 SELL_ALL_ON_START = os.getenv("SELL_ALL_ON_START", "true").lower() in ("1","true","yes")
 
 DATA_DIR = "/app/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+BUYS_FILE = os.path.join(DATA_DIR, "buys.json")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 DAILY_LOG = os.path.join(DATA_DIR, "daily_log.txt")
 
-# ---------- Ensure data dir ----------
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# ---------- Exchange init ----------
+# ---------- Exchange ----------
 API_KEY = os.getenv("KRAKEN_API_KEY")
 API_SECRET = os.getenv("KRAKEN_API_SECRET")
 if not API_KEY or not API_SECRET:
-    raise SystemExit("Missing KRAKEN_API_KEY / KRAKEN_API_SECRET in env vars")
+    raise SystemExit("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET in env vars")
 
 exchange = ccxt.kraken({
     "apiKey": API_KEY,
@@ -58,37 +53,37 @@ exchange = ccxt.kraken({
 })
 exchange.load_markets()
 
-# ---------- Persistent stats ----------
-default_stats = {
+# ---------- Persistence helpers ----------
+def load_json(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        print(f"[WARN] load {path} failed, using default", flush=True)
+    return default
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+# persistent structures
+# buys: base -> { pair, price, qty, time_iso, cooldown_until_iso }
+buys = load_json(BUYS_FILE, {})
+# stats
+stats = load_json(STATS_FILE, {
     "lifetime_take_profit_usd": 0.0,
     "lifetime_dust_recovered_usd": 0.0,
     "reserve_usd": 0.0,
     "last_daily_summary": None
-}
+})
 
-def load_stats():
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return default_stats.copy()
-
-def save_stats(s):
-    with open(STATS_FILE, "w") as f:
-        json.dump(s, f)
-
-stats = load_stats()
-
-# running counters
 trade_log = deque(maxlen=1000)
 
 def now(): return datetime.utcnow().replace(tzinfo=timezone.utc)
-
-def log(msg):
-    ts = now().isoformat()
-    print(f"[{ts}] {msg}", flush=True)
+def log(s): print(f"[{now().isoformat()}] {s}", flush=True)
 
 # ---------- Market helpers ----------
 def safe_fetch_balance():
@@ -99,12 +94,12 @@ def safe_fetch_balance():
         return {"total": {}}
 
 def get_total_usd():
-    bal = safe_fetch_balance().get("total", {})
-    return float(bal.get("USD") or bal.get("ZUSD") or 0.0)
+    b = safe_fetch_balance().get("total", {})
+    return float(b.get("USD") or b.get("ZUSD") or 0.0)
 
 def get_base_balance(base):
-    bal = safe_fetch_balance().get("total", {})
-    return float(bal.get(base) or 0.0)
+    b = safe_fetch_balance().get("total", {})
+    return float(b.get(base) or 0.0)
 
 def precision_amount(pair):
     m = exchange.markets.get(pair)
@@ -124,16 +119,15 @@ def quantize_amount(amount, prec):
     f = 10 ** prec
     return math.floor(amount * f) / f
 
-def fetch_ticker_safe(pair):
+def fetch_ticker(pair):
     try:
         return exchange.fetch_ticker(pair)
     except Exception as e:
-        # log minimal to avoid spamming
-        # log(f"[WARN] ticker {pair} error: {e}")
+        # minimal logging
         return None
 
 def fetch_price(pair):
-    t = fetch_ticker_safe(pair)
+    t = fetch_ticker(pair)
     if not t:
         return None
     return float(t.get("last") or t.get("close"))
@@ -167,27 +161,12 @@ def short_long_momentum(pair, short=3, long=15):
     return short_ma > long_ma
 
 def volume_ok(pair, min_vol=MIN_VOLUME_24H):
-    t = fetch_ticker_safe(pair)
+    t = fetch_ticker(pair)
     if not t:
         return True
     vol = t.get('baseVolume') or t.get('quoteVolume') or 0
-    if vol is None:
-        return True
     try:
         return float(vol) >= min_vol
-    except Exception:
-        return True
-
-def spread_ok(pair, max_spread_pct=MAX_SPREAD_PCT):
-    try:
-        ob = exchange.fetch_order_book(pair, 5)
-        bids = ob.get('bids') or []
-        asks = ob.get('asks') or []
-        if not bids or not asks:
-            return False
-        bid = bids[0][0]; ask = asks[0][0]
-        mid = (bid + ask) / 2.0
-        return (ask - bid) / mid <= max_spread_pct
     except Exception:
         return True
 
@@ -196,15 +175,14 @@ def market_sell(pair, qty):
     try:
         res = exchange.create_market_sell_order(pair, qty)
         log(f"[SELL EXECUTED] {pair} qty={qty}")
-        return res
+        return {"ok": True, "res": res}
     except Exception as e:
         s = str(e).lower()
-        if "volume" in s or "minimum" in s:
-            # min volume issue
+        if "volume" in s and "minimum" in s or "minimum" in s:
             log(f"[SELL FAILED-MIN] {pair}: {e}")
-            return {"error": "min_volume"}
+            return {"ok": False, "error": "min_volume", "raw": str(e)}
         log(f"[SELL FAILED] {pair}: {e}")
-        return {"error": str(e)}
+        return {"ok": False, "error": str(e)}
 
 def market_buy(pair, usd_amount):
     price = fetch_price(pair)
@@ -224,22 +202,48 @@ def market_buy(pair, usd_amount):
     try:
         res = exchange.create_market_buy_order(pair, qty)
         log(f"[BUY EXECUTED] {pair} qty={qty} usd_alloc={usd_amount:.2f}")
-        return price, qty
+        return {"price": price, "qty": qty, "res": res}
     except Exception as e:
         log(f"[BUY FAILED] {pair}: {e}")
         return None
 
-# ---------- Ensure tradeable function ----------
+# ---------- Stats helpers ----------
+def record_take_profit(net_usd):
+    stats["lifetime_take_profit_usd"] = stats.get("lifetime_take_profit_usd", 0.0) + net_usd
+    reinvest = net_usd * 0.70
+    reserve_add = net_usd * 0.30
+    stats["reserve_usd"] = stats.get("reserve_usd", 0.0) + reserve_add
+    save_json(STATS_FILE, stats)
+    return reinvest, reserve_add
+
+def record_dust(amount_usd):
+    stats["lifetime_dust_recovered_usd"] = stats.get("lifetime_dust_recovered_usd", 0.0) + amount_usd
+    save_json(STATS_FILE, stats)
+
+def maybe_write_daily_summary():
+    today = now().astimezone(timezone.utc).strftime("%Y-%m-%d")
+    if stats.get("last_daily_summary") == today:
+        return
+    summary = (
+        f"[{today} UTC] DAILY SUMMARY\n"
+        f"Take-profit total: ${stats.get('lifetime_take_profit_usd',0.0):.2f}\n"
+        f"Dust recovered: ${stats.get('lifetime_dust_recovered_usd',0.0):.2f}\n"
+        f"Reserve (mem): ${stats.get('reserve_usd',0.0):.2f}\n"
+        "----\n"
+    )
+    with open(DAILY_LOG, "a") as f:
+        f.write(summary)
+    stats["last_daily_summary"] = today
+    save_json(STATS_FILE, stats)
+    log(f"[DAILY SUMMARY WRITTEN] {today}")
+
+# ---------- Ensure funds (sell worst) ----------
 def ensure_tradeable(target_usd):
-    """
-    If tradeable pool < target_usd, sell worst performers until enough.
-    """
     total = get_total_usd()
     tradeable = max(0.0, total * TRADEABLE_FRAC - stats.get("reserve_usd", 0.0))
     log(f"[ENSURE] tradeable ${tradeable:.2f} target ${target_usd:.2f}")
     if tradeable >= target_usd:
         return True
-    # gather positions
     balances = safe_fetch_balance().get("total", {})
     held = []
     for pair in exchange.markets:
@@ -250,12 +254,12 @@ def ensure_tradeable(target_usd):
         if amt <= 0:
             continue
         price = fetch_price(pair)
-        bought = None  # we don't persist buy prices across restarts reliably here
         if not price:
             continue
-        held.append((0.0, pair, base, amt, price, bought))
-    # sell smallest first (arbitrary), better heuristics can be added
-    for _, pair, base, amt, price, bought in held:
+        held.append((amt * price, pair, base, amt, price))
+    # sell largest USD value first to free funds
+    held.sort(reverse=True)
+    for _, pair, base, amt, price in held:
         if tradeable >= target_usd:
             break
         prec = precision_amount(pair)
@@ -263,60 +267,19 @@ def ensure_tradeable(target_usd):
         if sell_qty <= 0:
             continue
         res = market_sell(pair, sell_qty)
-        if isinstance(res, dict) and res.get("error") == "min_volume":
-            log(f"[ENSURE] {pair} unsellable (min volume). Skipping.")
+        if res.get("error") == "min_volume":
+            log(f"[ENSURE] {pair} unsellable (min vol). skipping")
             continue
-        # update tradeable
+        time.sleep(0.3)
         total = get_total_usd()
         tradeable = max(0.0, total * TRADEABLE_FRAC - stats.get("reserve_usd", 0.0))
-        time.sleep(0.3)
     total = get_total_usd()
     tradeable = max(0.0, total * TRADEABLE_FRAC - stats.get("reserve_usd", 0.0))
     return tradeable >= target_usd
 
-# ---------- Stats and daily summary ----------
-def record_take_profit(amount_usd):
-    stats["lifetime_take_profit_usd"] = stats.get("lifetime_take_profit_usd", 0.0) + amount_usd
-    # split 70/30
-    reinvest = amount_usd * 0.70
-    reserve_add = amount_usd * 0.30
-    stats["reserve_usd"] = stats.get("reserve_usd", 0.0) + reserve_add
-    save_stats(stats)
-    return reinvest, reserve_add
-
-def record_dust(amount_usd):
-    stats["lifetime_dust_recovered_usd"] = stats.get("lifetime_dust_recovered_usd", 0.0) + amount_usd
-    save_stats(stats)
-
-def maybe_daily_summary():
-    today = now().astimezone(timezone.utc).strftime("%Y-%m-%d")
-    last = stats.get("last_daily_summary")
-    if last == today:
-        return
-    # write summary
-    summary = (
-        f"[{today} UTC] DAILY SUMMARY\n"
-        f"Take-profit total: ${stats.get('lifetime_take_profit_usd',0.0):.2f}\n"
-        f"Dust recovered: ${stats.get('lifetime_dust_recovered_usd',0.0):.2f}\n"
-        f"Reserve (mem): ${stats.get('reserve_usd',0.0):.2f}\n"
-        f"----\n"
-    )
-    with open(DAILY_LOG, "a") as f:
-        f.write(summary)
-    stats["last_daily_summary"] = today
-    save_stats(stats)
-    log(summary.strip().splitlines()[0])
-
-# ---------- Main loop state ----------
-# Track buys we did in memory (lost on restart)
-in_memory_buys = {}   # base -> {"pair": pair, "price": buy_price, "qty": qty, "time": datetime}
-
-restricted_pairs = set()
-
-# ---------- Startup behavior ----------
+# ---------- Startup sell (optional) ----------
 if SELL_ALL_ON_START:
-    log("SELL_ALL_ON_START enabled — attempting to liquidate non-USD holdings...")
-    # sell what we can
+    log("SELL_ALL_ON_START enabled - attempting to liquidate non-USD holdings...")
     balances = safe_fetch_balance().get("total", {})
     for asset, amt in list(balances.items()):
         if asset in ("USD", "ZUSD") or float(amt) <= 0:
@@ -334,7 +297,7 @@ if SELL_ALL_ON_START:
                     log(f"[START SKIP] {pair}: qty after precision 0")
                     continue
                 res = market_sell(pair, sell_qty)
-                if isinstance(res, dict) and res.get("error") == "min_volume":
+                if res.get("error") == "min_volume":
                     log(f"[START] {pair} min-volume unsellable; left as dust")
                 time.sleep(0.3)
                 break
@@ -344,17 +307,11 @@ last_summary_time = time.time()
 while True:
     loop_start = time.time()
     try:
-        # expire cooldowns
-        for b in list(in_memory_buys.keys()):
-            # no automatic expiry here; cooldowns applied on sell sets
-
-            pass
-
         total_usd = get_total_usd()
         tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - stats.get("reserve_usd", 0.0))
         log(f"[POOL] Total USD ${total_usd:.2f} | Tradeable ${tradeable_pool:.2f} | Reserve(mem) ${stats.get('reserve_usd',0.0):.2f}")
 
-        # build candidate list: all /USD markets (skip obvious stables)
+        # candidate list
         candidates = []
         for pair, meta in exchange.markets.items():
             if not pair.endswith('/USD'):
@@ -362,29 +319,23 @@ while True:
             base = pair.split('/')[0].upper()
             if base in ("USDT","USDC","USD","ZUSD"):
                 continue
-            if pair in restricted_pairs:
-                continue
             candidates.append(pair)
 
-        # SELL PHASE: evaluate each held position (from in_memory_buys and on-exchange holdings)
+        # SELL PHASE: check holdings
         balances = safe_fetch_balance().get("total", {})
-        # check holdings from wallet
         held_pairs = []
         for pair in candidates:
             base = pair.split('/')[0]
             amt = float(balances.get(base) or 0.0)
             if amt > 0:
                 held_pairs.append((pair, amt))
-
         for pair, amt in held_pairs:
             base = pair.split('/')[0]
             price = fetch_price(pair)
             if price is None:
                 continue
-            rec = in_memory_buys.get(base)
+            rec = buys.get(base)
             buy_price = rec.get("price") if rec else None
-            buy_qty_mem = rec.get("qty") if rec else None
-
             net_usd = None
             if buy_price:
                 gross = (price - buy_price) * amt
@@ -394,90 +345,70 @@ while True:
             else:
                 net_pct = None
 
-            # immediate stop-loss
+            # stop-loss
             if buy_price and (price / buy_price - 1.0) <= STOP_LOSS_PCT:
-                log(f"[SELL-STOPLOSS] {base} buy={buy_price:.8f} now={price:.8f} pct={(price/buy_price-1.0)*100:.2f}% -> SELL")
+                log(f"[SELL-STOPLOSS] {base} buy={buy_price:.8f} now={price:.8f} -> SELL")
                 prec = precision_amount(pair)
                 sell_qty = quantize_amount(amt, prec)
                 if sell_qty > 0:
                     res = market_sell(pair, sell_qty)
-                    if isinstance(res, dict) and res.get("error") == "min_volume":
+                    if res.get("error") == "min_volume":
                         log(f"[DUST] {pair} unsellable at min volume")
                     else:
                         if net_usd and net_usd > 0:
                             reinvest, reserve_add = record_take_profit(net_usd)
-                            log(f"[RESERVE] +${reserve_add:.4f}  reinvest ${reinvest:.4f}")
-                        # clear mem buy
-                        if base in in_memory_buys:
-                            del in_memory_buys[base]
+                            log(f"[RESERVE] +${reserve_add:.4f} reinvest ${reinvest:.4f}")
+                        if base in buys:
+                            del buys[base]
+                            save_json(BUYS_FILE, buys)
                         time.sleep(0.3)
                 continue
 
-            # take profit (net)
+            # take-profit net
             if buy_price and net_pct is not None and net_pct >= TAKE_PROFIT_NET_PCT:
                 log(f"[SELL-TP] {base} buy={buy_price:.8f} now={price:.8f} net%={(net_pct)*100:.2f}% -> SELL")
                 prec = precision_amount(pair)
                 sell_qty = quantize_amount(amt, prec)
                 if sell_qty > 0:
                     res = market_sell(pair, sell_qty)
-                    if isinstance(res, dict) and res.get("error") == "min_volume":
+                    if res.get("error") == "min_volume":
                         log(f"[DUST] {pair} unsellable at min volume after TP")
                     else:
-                        # record profit (approx)
                         if net_usd and net_usd > 0:
                             reinvest, reserve_add = record_take_profit(net_usd)
                             log(f"[RESERVE] +${reserve_add:.4f} reinvest ${reinvest:.4f}")
-                        if base in in_memory_buys:
-                            del in_memory_buys[base]
+                        if base in buys:
+                            del buys[base]
+                            save_json(BUYS_FILE, buys)
                         time.sleep(0.3)
                 continue
 
-            # reversal sell (2 red candles + drop >= REVERSAL_DROP_PCT)
+            # reversal sell
             closes = last_n_closes(pair, 3)
             if len(closes) >= 3 and (closes[-1] < closes[-2] < closes[-3]):
                 peak = recent_peak(pair, minutes=30)
                 if peak and (peak - price) / peak >= REVERSAL_DROP_PCT:
-                    log(f"[SELL-REVERSAL] {base} reversal detected -> SELL (peak={peak:.8f} now={price:.8f})")
+                    log(f"[SELL-REV] {base} reversal -> SELL")
                     prec = precision_amount(pair)
                     sell_qty = quantize_amount(amt, prec)
                     if sell_qty > 0:
                         res = market_sell(pair, sell_qty)
-                        if isinstance(res, dict) and res.get("error") == "min_volume":
-                            log(f"[DUST] {pair} unsellable at min volume on reversal")
+                        if res.get("error") == "min_volume":
+                            log(f"[DUST] {pair} unsellable on reversal")
                         else:
-                            if base in in_memory_buys:
-                                del in_memory_buys[base]
+                            if base in buys:
+                                del buys[base]; save_json(BUYS_FILE, buys)
                             time.sleep(0.3)
                     continue
 
-            # sideways recycle
-            if buy_price and base in in_memory_buys and (now() - in_memory_buys[base]["time"]).total_seconds() >= SIDEWAYS_SECONDS:
-                if abs((price / buy_price) - 1.0) <= SIDEWAYS_THRESHOLD and not short_long_momentum(pair, short=SHORT_MA_MIN, long=LONG_MA_MIN):
-                    log(f"[SELL-SIDEWAYS] {base} held long & sideways -> SELL")
-                    prec = precision_amount(pair)
-                    sell_qty = quantize_amount(amt, prec)
-                    if sell_qty > 0:
-                        res = market_sell(pair, sell_qty)
-                        if isinstance(res, dict) and res.get("error") == "min_volume":
-                            log(f"[DUST] {pair} unsellable at min volume on sideways")
-                        else:
-                            if base in in_memory_buys:
-                                del in_memory_buys[base]
-                            time.sleep(0.3)
-                    continue
-
-            # dust attempt: if amt >= market min, try to sell tiny balances to free funds
+            # attempt selling dust if amt >= market min
             m = market_min_amount(pair)
             if m and amt >= m:
-                # try to sell tiny balance
                 prec = precision_amount(pair)
                 sell_qty = quantize_amount(amt, prec)
                 if sell_qty > 0:
                     res = market_sell(pair, sell_qty)
-                    if isinstance(res, dict) and res.get("error") == "min_volume":
-                        log(f"[DUST] {pair} still unsellable")
-                    else:
-                        # compute dust USD and record
+                    if not res.get("error"):
                         dust_usd = sell_qty * price
                         record_dust(dust_usd)
                         log(f"[DUST-SOLD] {pair} recovered ${dust_usd:.4f}")
@@ -488,22 +419,21 @@ while True:
         tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - stats.get("reserve_usd", 0.0))
         log(f"[AFTER SELL] Total USD ${total_usd:.2f} | Tradeable ${tradeable_pool:.2f} | Reserve(mem) ${stats.get('reserve_usd',0.0):.2f}")
 
-        # ensure tradeable funds available for buys
         if tradeable_pool < MIN_TRADE_USD:
             ensure_tradeable(MIN_TRADE_USD * 2)
             total_usd = get_total_usd()
             tradeable_pool = max(0.0, total_usd * TRADEABLE_FRAC - stats.get("reserve_usd", 0.0))
 
         # BUY PHASE
-        buys = 0
-        current_positions = sum(1 for k in in_memory_buys.keys() if get_base_balance(k) > 0)
+        buys_this_loop = 0
+        current_positions = sum(1 for b in buys.keys() if get_base_balance(b) > 0)
         free_slots = max(0, MAX_CONCURRENT_POS - current_positions)
         if free_slots <= 0:
-            log("[BUY] max concurrent positions reached; skipping buys")
+            log("[BUY] max concurrent positions reached")
         else:
             per_buy = max(MIN_TRADE_USD, tradeable_pool / max(1, free_slots))
             for pair in candidates:
-                if buys >= MAX_BUYS_PER_LOOP:
+                if buys_this_loop >= MAX_BUYS_PER_LOOP:
                     break
                 if tradeable_pool < MIN_TRADE_USD:
                     break
@@ -511,13 +441,11 @@ while True:
                 if price is None:
                     continue
                 base = pair.split('/')[0]
+                # skip if already holding
                 if get_base_balance(base) > 0:
                     continue
-                if base in in_memory_buys and (now() < in_memory_buys[base].get("cooldown_until", now())):
-                    continue
-                if not volume_ok(pair):
-                    continue
-                if not spread_ok(pair):
+                # liquidity/spread
+                if not volume_ok(pair) or not spread_ok(pair):
                     continue
                 peak = recent_peak(pair, minutes=15)
                 if not peak:
@@ -530,36 +458,42 @@ while True:
                     continue
                 if not short_long_momentum(pair, short=SHORT_MA_MIN, long=LONG_MA_MIN):
                     continue
-                # ensure allocation meets market min
+
+                # --- key logic to combine dust: ensure post-buy qty >= market min ---
                 m = market_min_amount(pair)
-                usd_needed = per_buy
+                usd_alloc = per_buy
                 if m:
-                    needed = m * price
-                    if usd_needed < needed:
-                        if tradeable_pool >= needed:
-                            usd_needed = needed
+                    current_base = get_base_balance(base)
+                    need_qty = max(0.0, m - current_base)
+                    usd_needed_for_min = need_qty * price
+                    if usd_alloc < usd_needed_for_min:
+                        # try to increase allocation up to tradeable_pool
+                        if tradeable_pool >= usd_needed_for_min:
+                            usd_alloc = usd_needed_for_min
                         else:
-                            log(f"[BUY SKIP] {pair}: per_buy ${per_buy:.2f} < required ${needed:.2f} to meet min")
+                            log(f"[BUY SKIP] {pair}: per_buy ${per_buy:.2f} insufficient to reach min. need ${usd_needed_for_min:.2f}")
                             continue
-                res = market_buy(pair, usd_needed)
+
+                # finally buy
+                res = market_buy(pair, usd_alloc)
                 if res:
-                    p_buy, qty = res
-                    in_memory_buys[base] = {"pair": pair, "price": p_buy, "qty": qty, "time": now(),
-                                            "cooldown_until": now() + timedelta(minutes=COOLDOWN_MINUTES)}
-                    trade_log.append(("BUY", base, p_buy, qty, usd_needed, now().isoformat()))
-                    buys += 1
-                    tradeable_pool -= usd_needed
+                    p_buy = res["price"]; qty = res["qty"]
+                    buys[base] = {"pair": pair, "price": p_buy, "qty": qty, "time": now().isoformat(),
+                                  "cooldown_until": (now() + timedelta(minutes=COOLDOWN_MINUTES)).isoformat()}
+                    save_json(BUYS_FILE, buys)
+                    trade_log.append(("BUY", base, p_buy, qty, usd_alloc, now().isoformat()))
+                    buys_this_loop += 1
+                    tradeable_pool -= usd_alloc
                     time.sleep(0.5)
 
-        # periodic daily summary write
-        if time.time() - last_summary_time >= 600:  # every 10 minutes write summary to stdout and maybe daily file
+        # periodic summary every 10 minutes
+        if time.time() - last_summary_time >= 600:
             log(f"[SUMMARY] TP=${stats.get('lifetime_take_profit_usd',0.0):.2f} | Dust=${stats.get('lifetime_dust_recovered_usd',0.0):.2f} | Reserve=${stats.get('reserve_usd',0.0):.2f}")
-            maybe_daily_summary()
+            maybe_write_daily_summary()
             last_summary_time = time.time()
 
     except Exception as e:
         log(f"[ERROR] main loop exception: {e}")
-
+        traceback.print_exc()
     elapsed = time.time() - loop_start
-    to_sleep = max(1, CYCLE_SECONDS - elapsed)
-    time.sleep(to_sleep)
+    time.sleep(max(1, CYCLE_SECONDS - elapsed))
