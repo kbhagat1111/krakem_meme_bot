@@ -17,13 +17,13 @@ SPREAD_LIMIT       = float(os.getenv("SPREAD_LIMIT", "1.0"))
 LOOP_DELAY         = int(os.getenv("LOOP_DELAY", "15"))
 RESERVE_RATIO      = float(os.getenv("RESERVE_RATIO", "0.30"))
 
-# Old Kraken fee setting kept for normal loop
+# Kraken fee for normal loop
 KRAKEN_FEE_PCT     = float(os.getenv("KRAKEN_FEE_PCT", "0.26"))
 
-# New massive fee settings for startup force-sell
-KRAKEN_FEE = 0.375        # 37.5% per trade
-ROUND_TRIP_FEE = 0.75     # 75% total
-PROFIT_BUFFER = 0.05      # 5% above fees
+# Corrected fee settings for startup force-sell
+KRAKEN_FEE = 0.00375      # 0.375% per trade
+ROUND_TRIP_FEE = 0.0075   # 0.75% total (buy + sell)
+PROFIT_BUFFER = 0.0005    # 0.05% above round-trip fee
 
 MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "5"))
 MIN_USD_PER_BUY    = float(os.getenv("MIN_USD_PER_BUY", "10"))
@@ -247,7 +247,6 @@ for pair in TRADE_PAIRS:
     bid, ask = fetch_bid_ask(pair)
     if not bid:
         continue
-    # Estimate cost basis if unknown
     entry_px = current_cost_basis_px(pair) or bid
     profit_pct = ((bid - entry_px) / entry_px)
     if profit_pct > (ROUND_TRIP_FEE + PROFIT_BUFFER):
