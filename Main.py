@@ -4,36 +4,27 @@ import time
 from datetime import datetime, timezone
 import statistics
 import math
-
 import ccxt
 
-# ===================== CONFIG ===================== #
-API_KEY = os.getenv("KRAKEN_API_KEY", "")
-API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
+# ========================= CONFIG (env overrides) ========================= #
+API_KEY            = os.getenv("KRAKEN_API_KEY", "")
+API_SECRET         = os.getenv("KRAKEN_API_SECRET", "")
+# Trading universe: leave empty to auto-pick meme pairs against USD
+TRADE_PAIRS_ENV    = os.getenv("TRADE_PAIRS", "")  # e.g. "DOGE/USD,SHIB/USD"
+PROFIT_TARGET_USD  = float(os.getenv("PROFIT_TARGET_USD", "0.15"))   # net after fees
+DIP_PERCENT        = float(os.getenv("DIP_PERCENT", "0.50"))         # % drop from recent high to consider a buy
+MOMENTUM_BARS      = int(os.getenv("MOMENTUM_BARS", "5"))            # bars for simple momentum check
+TIMEFRAME          = os.getenv("TIMEFRAME", "1m")
+SPREAD_LIMIT       = float(os.getenv("SPREAD_LIMIT", "1.0"))         # % max allowed bid/ask spread
+LOOP_DELAY         = int(os.getenv("LOOP_DELAY", "15"))              # seconds
+RESERVE_RATIO      = float(os.getenv("RESERVE_RATIO", "0.30"))       # 30% of realized profits saved
+# Kraken taker fee (market orders). Default 0.26%. Use env to match your account tier.
+KRAKEN_FEE_PCT     = float(os.getenv("KRAKEN_FEE_PCT", "0.26"))
 
-# Leave empty to auto-pick common meme pairs; or set manually e.g. ["DOGE/USD","SHIB/USD"]
-TRADE_PAIRS = []
-
-# Risk & trade parameters
-TIMEFRAME = "1m"        # small TF for scalping
-LOOP_DELAY = 10         # seconds between cycles
-CANDLE_LOOKBACK = 30    # how many candles to fetch each time
-MOMENTUM_BARS = 5       # last-N closes must show momentum
-DIP_PERCENT = 2.0       # % drop from recent high to consider BUY (e.g., 2.0 = 2%)
-SPREAD_LIMIT = 1.0      # max % bid/ask spread allowed
-
-# Profit logic (fee-aware)
-# Kraken taker fee typical default ~0.26% (adjust if your tier is different)
-KRAKEN_FEE_RATE = float(os.getenv("KRAKEN_FEE_RATE", "0.0026"))  # per side
-EXTRA_MARGIN = float(os.getenv("EXTRA_MARGIN", "0.0010"))        # 0.10% cushion over fees
-MIN_ABS_PROFIT = float(os.getenv("MIN_ABS_PROFIT", "0.05"))      # at least $0.05 net after fees
-
-# Position sizing & money management
-MAX_OPEN_POSITIONS = 4                # cap concurrent positions
-PER_BUY_USD = 20.0                    # nominal USD to deploy per new entry
-RESERVE_RATIO = 0.30                  # 30% of realized profit goes to reserve (not traded)
-SELL_ALL_ON_START = os.getenv("SELL_ALL_ON_START", "false").lower() == "true"
-# ================================================== #
+# Per-trade USD sizing — you can make this dynamic; here we keep it simple:
+MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "5"))       # max different coins held
+MIN_USD_PER_BUY    = float(os.getenv("MIN_USD_PER_BUY", "10"))       # skip if below this
+# ======================================================================== #
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -41,312 +32,328 @@ def now():
 def log(msg):
     print(f"[{now()}] {msg}", flush=True)
 
-# -------- Exchange bootstrap -------- #
+def as_fee_fraction():
+    # e.g. 0.26% -> 0.0026
+    return KRAKEN_FEE_PCT / 100.0
+
+# ---------- Connect Kraken via CCXT ----------
 exchange = ccxt.kraken({
-    "apiKey": API_KEY,
-    "secret": API_SECRET,
-    "enableRateLimit": True,
+    'apiKey': API_KEY,
+    'secret': API_SECRET,
+    'enableRateLimit': True,
 })
 exchange.load_markets()
 
-
-# -------- Helpers for markets / balances -------- #
-def usd_balance():
-    try:
-        bal = exchange.fetch_balance()
-        # Kraken returns 'USD' balance key
-        return float(bal.get("total", {}).get("USD", 0.0))
-    except Exception as e:
-        log(f"[BALANCE ERROR] {e}")
-        return 0.0
-
-def base_balance(base):
-    try:
-        bal = exchange.fetch_balance()
-        return float(bal.get("total", {}).get(base, 0.0))
-    except Exception as e:
-        log(f"[BALANCE ERROR] {base}: {e}")
-        return 0.0
-
-def get_pairs():
-    if TRADE_PAIRS:
-        return TRADE_PAIRS[:]
+# ---------- Pair Selection ----------
+def get_auto_meme_pairs():
     memes = []
-    for symbol, m in exchange.markets.items():
-        if not symbol.endswith("/USD"):
+    for sym, m in exchange.markets.items():
+        if not sym.endswith("/USD"):
             continue
-        low = symbol.lower()
-        if any(x in low for x in ["doge", "shib", "pepe", "floki", "bonk"]):
-            if m.get("active", True):
-                memes.append(symbol)
-    # Deduplicate & stable order
-    uniq = sorted(set(memes))
-    # Reasonable default focus set if too many
-    focus = [s for s in uniq if any(k in s for k in ["DOGE/", "SHIB/", "PEPE/", "FLOKI/", "BONK/"])]
-    return focus[:5] if focus else uniq[:5]
+        base_lower = m['base'].lower()
+        name_lower = sym.lower()
+        if any(tag in base_lower or tag in name_lower for tag in ['doge', 'shib', 'pepe', 'floki', 'inu', 'bonk']):
+            memes.append(sym)
+    # prefer the most standard symbols (avoid USDC/USDT variants here)
+    # keep a small focused list
+    preferred = ['DOGE/USD', 'SHIB/USD', 'PEPE/USD', 'FLOKI/USD', 'BONK/USD']
+    picked = [p for p in preferred if p in memes]
+    # fallback add more if needed
+    for m in memes:
+        if len(picked) >= 8:
+            break
+        if m not in picked:
+            picked.append(m)
+    return picked or ['DOGE/USD', 'SHIB/USD', 'PEPE/USD']
 
-def fetch_candles(pair, limit=CANDLE_LOOKBACK):
-    try:
-        return exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=limit)
-    except Exception as e:
-        log(f"[OHLCV ERROR] {pair}: {e}")
-        return []
+TRADE_PAIRS = []
+if TRADE_PAIRS_ENV.strip():
+    TRADE_PAIRS = [p.strip() for p in TRADE_PAIRS_ENV.split(",") if p.strip()]
+else:
+    TRADE_PAIRS = get_auto_meme_pairs()
+log(f"Tracking pairs: {TRADE_PAIRS}")
+
+# ---------- Helpers ----------
+def fetch_bid_ask(pair):
+    ob = exchange.fetch_order_book(pair)
+    bid = ob['bids'][0][0] if ob['bids'] else None
+    ask = ob['asks'][0][0] if ob['asks'] else None
+    return bid, ask
 
 def spread_ok(pair):
-    try:
-        ob = exchange.fetch_order_book(pair)
-        bid = ob["bids"][0][0] if ob["bids"] else 0.0
-        ask = ob["asks"][0][0] if ob["asks"] else 0.0
-        if bid <= 0 or ask <= 0:
-            return False
-        spread_pct = (ask - bid) / bid * 100.0
-        return spread_pct <= SPREAD_LIMIT
-    except Exception as e:
-        log(f"[SPREAD ERROR] {pair}: {e}")
+    bid, ask = fetch_bid_ask(pair)
+    if not bid or not ask or bid <= 0 or ask <= 0:
         return False
+    spread_pct = ((ask - bid) / bid) * 100.0
+    return spread_pct <= SPREAD_LIMIT
 
-def min_amount(pair):
+def get_balance(symbol):
+    bal = exchange.fetch_balance()
+    return float(bal['total'].get(symbol, 0.0))
+
+def get_usd_balance():
+    # Kraken might expose USD under 'USD'
+    return get_balance('USD')
+
+def market_min_amount(pair):
     m = exchange.market(pair)
-    return float(((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
+    return m.get('limits', {}).get('amount', {}).get('min') or 0.0
 
-def min_cost(pair):
+def amount_precision(pair):
     m = exchange.market(pair)
-    return float(((m.get("limits") or {}).get("cost") or {}).get("min") or 0.0)
+    prec = m.get('precision', {}).get('amount')
+    return prec
 
-def tick_size(pair):
+def price_precision(pair):
     m = exchange.market(pair)
-    prec = (m.get("precision") or {}).get("amount", 8)
-    return max(1e-8, 10 ** (-prec))
+    prec = m.get('precision', {}).get('price')
+    return prec
 
-def quote_price(pair):
-    t = exchange.fetch_ticker(pair)
-    # Use mid price to estimate break-evens
-    bid = t.get("bid") or t.get("last")
-    ask = t.get("ask") or t.get("last")
-    if not bid or not ask:
-        return float(t.get("last", 0.0)), float(t.get("last", 0.0)), float(t.get("last", 0.0))
-    mid = (bid + ask) / 2.0
-    return float(bid), float(ask), float(mid)
+def round_amount(pair, qty):
+    prec = amount_precision(pair)
+    if prec is None:
+        # fallback to kraken typical step for tiny coins
+        return float(qty)
+    step = 10 ** (-prec)
+    return math.floor(qty / step) * step
 
+def round_price(pair, px):
+    prec = price_precision(pair)
+    if prec is None:
+        return float(px)
+    step = 10 ** (-prec)
+    return math.floor(px / step) * step
 
-# -------- Fee-aware math -------- #
-def net_profit_after_fees_usd(qty, buy_price, sell_price):
-    """
-    Profit after taker fees on both sides:
-    Buy cash outflow = qty * buy_price * (1 + fee)
-    Sell cash inflow = qty * sell_price * (1 - fee)
-    Net = inflow - outflow
-    """
-    outflow = qty * buy_price * (1.0 + KRAKEN_FEE_RATE)
-    inflow = qty * sell_price * (1.0 - KRAKEN_FEE_RATE)
-    return inflow - outflow
+def recent_closes(pair, limit):
+    try:
+        candles = exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=limit)
+        return [c[4] for c in candles]  # close
+    except Exception as e:
+        log(f"[CANDLE ERROR] {pair}: {e}")
+        return []
 
-def required_sell_price_for_min_profit(buy_price, qty):
-    """
-    Solve for sell_price such that net_profit >= MIN_ABS_PROFIT and margin >= (2*fee + extra)
-    We enforce BOTH:
-      1) percentage margin >= (2*fee + EXTRA_MARGIN)
-      2) absolute profit >= MIN_ABS_PROFIT
-    Take the max of the two requirements.
-    """
-    # Percent condition:
-    # sell >= buy * (1 + 2*fee + extra) / (1 - fee_adjust_for_sell_side)
-    # Derive using net profit margin approximation:
-    pct_target = buy_price * (1.0 + (2.0 * KRAKEN_FEE_RATE + EXTRA_MARGIN)) / (1.0 - 0.0)
-    # Absolute condition: solve inflow - outflow >= MIN_ABS_PROFIT
-    # qty*sell*(1-fee) - qty*buy*(1+fee) >= MIN_ABS_PROFIT
-    # sell >= [MIN_ABS_PROFIT/qty + buy*(1+fee)] / (1-fee)
-    if qty <= 0:
-        return float("inf")
-    abs_target = (MIN_ABS_PROFIT / qty + buy_price * (1.0 + KRAKEN_FEE_RATE)) / (1.0 - KRAKEN_FEE_RATE)
-    return max(pct_target, abs_target)
-
-
-# -------- Signals -------- #
 def buy_signal(pair):
-    candles = fetch_candles(pair, CANDLE_LOOKBACK)
-    if len(candles) < max(MOMENTUM_BARS + 1, 10):
-        return False, 0.0
-    closes = [c[4] for c in candles]
+    closes = recent_closes(pair, max(15, MOMENTUM_BARS * 3))
+    if len(closes) < MOMENTUM_BARS + 3:
+        return False
     current = closes[-1]
-    recent_high = max(closes[-10:])                # short window high
-    dip_pct = (recent_high - current) / recent_high * 100.0 if recent_high > 0 else 0.0
-    # upward momentum: current above mean of last MOMENTUM_BARS
-    mom_ok = current > statistics.mean(closes[-MOMENTUM_BARS:])
-    return (dip_pct >= DIP_PERCENT and mom_ok), current
+    recent_high = max(closes)
+    if recent_high <= 0:
+        return False
+    drop_pct = ((recent_high - current) / recent_high) * 100.0
+    if drop_pct < DIP_PERCENT:
+        return False
+    sma = statistics.mean(closes[-MOMENTUM_BARS:])
+    # momentum: price rising above short SMA
+    return current > sma
 
-def sell_signal(buy_px, qty, current_px):
-    target_px = required_sell_price_for_min_profit(buy_px, qty)
-    return current_px >= target_px, target_px
+# ---------- Position & PnL Tracking ----------
+# Keep a simple book: per pair -> {'qty': ..., 'cost_usd': ...}
+# cost_usd includes buy fees (so it’s your true cost basis)
+book = {}
+realized_profit_total = 0.0
+reserve_pool = 0.0
 
+def mark_buy(pair, qty, fill_price):
+    """Record/average-in a filled buy. Include buy fee in cost basis."""
+    global book
+    fee = as_fee_fraction()
+    # USD spent at market ask + taker fee
+    cost_usd = qty * fill_price * (1.0 + fee)
+    if pair in book and book[pair]['qty'] > 0:
+        old_qty = book[pair]['qty']
+        old_cost = book[pair]['cost_usd']
+        new_qty = old_qty + qty
+        new_cost = old_cost + cost_usd
+        book[pair] = {'qty': new_qty, 'cost_usd': new_cost}
+    else:
+        book[pair] = {'qty': qty, 'cost_usd': cost_usd}
 
-# -------- Order wrappers -------- #
-def clamp_amount(pair, qty):
-    mmin = min_amount(pair)
-    if qty < mmin:
+def mark_sell(pair, qty_sold, fill_price):
+    """
+    Realize PnL for qty_sold out of position.
+    Returns realized_profit (after both buy fee already in cost, and sell fee subtracted here).
+    """
+    global book
+    fee = as_fee_fraction()
+    if pair not in book or book[pair]['qty'] <= 0:
         return 0.0
-    step = tick_size(pair)
-    # floor to step
-    steps = math.floor(qty / step)
-    return round(steps * step, 8)
 
-def can_afford_cost(pair, usd):
-    cmin = min_cost(pair)
-    return usd >= (cmin or 0.0)
+    pos = book[pair]
+    pos_qty = pos['qty']
+    pos_cost = pos['cost_usd']
+    if qty_sold > pos_qty:
+        qty_sold = pos_qty
 
-def place_market_buy(pair, usd_to_spend):
-    bid, ask, mid = quote_price(pair)
-    price = float(ask or mid or bid)
-    if price <= 0:
-        raise Exception("No valid ask price")
-    qty_raw = usd_to_spend / price
-    qty = clamp_amount(pair, qty_raw)
-    if qty <= 0:
-        raise Exception(f"Qty {qty_raw} too small for market min {min_amount(pair)}")
-    if not can_afford_cost(pair, usd_to_spend):
-        raise Exception(f"Cost ${usd_to_spend:.2f} below min cost {min_cost(pair)}")
-    order = exchange.create_market_buy_order(pair, qty)
-    return order, qty, price
+    # pro-rata cost for the slice we sell
+    cost_slice = pos_cost * (qty_sold / pos_qty)
+    # proceeds after taker fee on the sale
+    proceeds = qty_sold * fill_price * (1.0 - fee)
+    realized = proceeds - cost_slice
 
-def place_market_sell(pair, qty):
-    qty = clamp_amount(pair, qty)
-    if qty <= 0:
-        raise Exception(f"Sell qty too small for market min {min_amount(pair)}")
-    bid, ask, mid = quote_price(pair)
-    price = float(bid or mid or ask)
-    if price <= 0:
-        raise Exception("No valid bid price")
-    order = exchange.create_market_sell_order(pair, qty)
-    return order, qty, price
+    # reduce position
+    remain_qty = pos_qty - qty_sold
+    remain_cost = pos_cost - cost_slice
+    if remain_qty > 0:
+        book[pair] = {'qty': remain_qty, 'cost_usd': remain_cost}
+    else:
+        book.pop(pair, None)
 
+    return realized
 
-# -------- State -------- #
-# positions: pair -> {"base": str, "qty": float, "avg_price": float}
-positions = {}
-reserve_usd = 0.0
-realized_profit_usd = 0.0
+def current_cost_basis_px(pair):
+    """Average entry price INCLUDING buy fee (cost_usd / qty)."""
+    if pair not in book or book[pair]['qty'] <= 0:
+        return None
+    pos = book[pair]
+    if pos['qty'] <= 0:
+        return None
+    return pos['cost_usd'] / pos['qty']
 
+# ---------- Trading Ops ----------
+def can_trade_more_positions():
+    # Count open positions (qty > 0)
+    count = sum(1 for v in book.values() if v['qty'] > 0)
+    return count < MAX_CONCURRENT_POS
 
-# -------- Start: optionally liquidate -------- #
-def try_sell_all_small_holdings(pairs):
-    log("SELL_ALL_ON_START enabled — attempting to liquidate non-USD holdings (where size >= min).")
-    for pair in pairs:
-        base = pair.split("/")[0]
-        qty = base_balance(base)
-        if qty <= 0:
-            continue
-        amt = clamp_amount(pair, qty)
-        if amt <= 0:
-            log(f"[START SKIP] {pair}: qty after precision {amt}")
-            continue
-        try:
-            order, s_qty, s_px = place_market_sell(pair, amt)
-            net = net_profit_after_fees_usd(s_qty, s_px, s_px)  # zero-ish; just liquidation info
-            log(f"[START SELL] {pair} qty={s_qty} px≈{s_px} order={order.get('id','?')} net≈${net:.4f}")
-        except Exception as e:
-            log(f"[START SELL FAILED] {pair}: {e}")
+def create_market_buy(pair, usd_amount):
+    if usd_amount < MIN_USD_PER_BUY:
+        log(f"[BUY SKIP] {pair}: usd {usd_amount:.2f} < MIN_USD_PER_BUY {MIN_USD_PER_BUY}")
+        return None
 
+    bid, ask = fetch_bid_ask(pair)
+    if not ask:
+        log(f"[BUY SKIP] {pair}: no ask")
+        return None
 
-# -------- Main -------- #
-def main():
-    pairs = get_pairs()
-    log(f"Tracking pairs: {pairs}")
+    qty = usd_amount / ask
+    qty = round_amount(pair, qty)
+    min_amt = market_min_amount(pair)
+    if qty <= 0 or qty < min_amt:
+        log(f"[BUY SKIP] {pair}: qty {qty} < min {min_amt}")
+        return None
 
-    if SELL_ALL_ON_START:
-        try_sell_all_small_holdings(pairs)
+    try:
+        o = exchange.create_market_buy_order(pair, qty)
+        # Re-fetch last ask to estimate fill (Kraken may return fills in o)
+        fill_price = ask
+        log(f"[BUY] {pair} qty={qty} @~{fill_price}")
+        mark_buy(pair, qty, fill_price)
+        return o
+    except Exception as e:
+        log(f"[BUY ERROR] {pair}: {e}")
+        return None
 
-    global reserve_usd, realized_profit_usd
+def create_market_sell(pair, qty):
+    bid, ask = fetch_bid_ask(pair)
+    if not bid:
+        log(f"[SELL SKIP] {pair}: no bid")
+        return None
 
-    while True:
-        try:
-            # Print pool snapshot
-            cash = usd_balance()
-            log(f"[POOL] USD total ${cash + reserve_usd:.2f} | Tradeable ${cash:.2f} | Reserve ${reserve_usd:.2f}")
+    qty = round_amount(pair, qty)
+    min_amt = market_min_amount(pair)
+    if qty <= 0 or qty < min_amt:
+        log(f"[SELL SKIP] {pair}: qty {qty} < min {min_amt}")
+        return None
 
-            # Refresh positions from wallet for tracked pairs
-            for pair in pairs:
-                base = pair.split("/")[0]
-                qty = base_balance(base)
-                if qty > 0 and pair not in positions:
-                    # unknown cost basis if pre-held; set avg at current mid
-                    _, _, mid = quote_price(pair)
-                    positions[pair] = {"base": base, "qty": qty, "avg_price": mid}
-                    log(f"[SYNC] {pair} detected holdings qty={qty:.8f} avg≈{mid:.10f}")
-                if qty <= 0 and pair in positions:
-                    del positions[pair]
-                    log(f"[SYNC] {pair} position closed (no balance)")
+    try:
+        o = exchange.create_market_sell_order(pair, qty)
+        fill_price = bid
+        realized = mark_sell(pair, qty, fill_price)
+        log(f"[SELL] {pair} qty={qty} @~{fill_price} | realized ${realized:.4f}")
+        return o, realized
+    except Exception as e:
+        log(f"[SELL ERROR] {pair}: {e}")
+        return None
 
-            # Attempt sells first (profit protection)
-            for pair, pos in list(positions.items()):
+def required_take_profit_price(entry_px):
+    """
+    Compute the minimum sell price that yields PROFIT_TARGET_USD after BOTH buy+sell fees
+    for the WHOLE position of size 1. We’ll scale by size in decision logic.
+    For a position of Q at entry_px:
+      cost_usd = Q * entry_px * (1 + f)
+      need proceeds >= cost_usd + PROFIT_TARGET_USD
+      proceeds = Q * sell_px * (1 - f)
+      => sell_px >= ((cost_usd + PROFIT_TARGET_USD) / (Q * (1 - f)))
+      For per-unit: set Q=1 -> sell_px >= entry_px*(1+f)/(1-f) + PROFIT_TARGET_USD/(1-f)
+    """
+    f = as_fee_fraction()
+    return entry_px * (1 + f) / (1 - f) + (PROFIT_TARGET_USD / (1 - f))
+
+# ---------- Main Loop ----------
+while True:
+    try:
+        usd = get_usd_balance()
+        # Show pools: realized includes reserve growth
+        total_positions_value = 0.0
+        for pair, pos in list(book.items()):
+            if pos['qty'] <= 0:
+                continue
+            bid, ask = fetch_bid_ask(pair)
+            mkt = (bid or ask or 0.0)
+            total_positions_value += pos['qty'] * mkt
+
+        log(f"[POOL] USD ${usd:.2f} | Positions est ${total_positions_value:.2f} | Reserve ${reserve_pool:.2f}")
+
+        # ---- SELL logic: take profit when price >= fee-adjusted target
+        for pair in TRADE_PAIRS:
+            if pair not in book or book[pair]['qty'] <= 0:
+                continue
+            if not spread_ok(pair):
+                continue
+
+            entry_px = current_cost_basis_px(pair)  # includes buy fee
+            if entry_px is None:
+                continue
+
+            bid, ask = fetch_bid_ask(pair)
+            px = bid or 0.0
+            if px <= 0:
+                continue
+
+            min_take = required_take_profit_price(entry_px)
+            # Because required_take is per 1 unit, compare against px directly
+            if px >= min_take:
+                qty_to_sell = book[pair]['qty']
+                res = create_market_sell(pair, qty_to_sell)
+                if res:
+                    _, realized = res
+                    if realized > 0:
+                        # split 70/30
+                        reserve_add = realized * RESERVE_RATIO
+                        reserve_pool += reserve_add
+                        reinvest_usd = realized * (1.0 - RESERVE_RATIO)
+                        log(f"[PROFIT] {pair} realized ${realized:.4f} -> reserve +${reserve_add:.4f}, reinvest ${reinvest_usd:.4f}")
+                        # Optional: immediately re-buy the same pair with reinvest capital if signal says yes
+                        # Here we keep it simple: we’ll add reinvest to available USD naturally.
+
+        # Refresh USD after any sells
+        usd = get_usd_balance()
+
+        # ---- BUY logic: dip + momentum, good spread, size per position
+        open_positions = sum(1 for v in book.values() if v['qty'] > 0)
+        slots_left = max(0, MAX_CONCURRENT_POS - open_positions)
+
+        if slots_left > 0 and usd >= MIN_USD_PER_BUY:
+            # Simple even sizing per new position
+            per_trade_usd = max(MIN_USD_PER_BUY, usd / (slots_left + open_positions + 1))
+            for pair in TRADE_PAIRS:
+                if slots_left <= 0:
+                    break
+                if pair in book and book[pair]['qty'] > 0:
+                    continue
                 if not spread_ok(pair):
                     continue
-                _, _, mid = quote_price(pair)
-                ok, tgt = sell_signal(pos["avg_price"], pos["qty"], mid)
-                if ok:
-                    try:
-                        order, s_qty, s_px = place_market_sell(pair, pos["qty"])
-                        pnl = net_profit_after_fees_usd(s_qty, pos["avg_price"], s_px)
-                        realized_profit_usd += max(0.0, pnl)
-                        # 70/30 split on positive realized profit
-                        reserve_add = max(0.0, pnl) * RESERVE_RATIO
-                        reserve_usd += reserve_add
-                        log(f"[SELL] {pair} qty={s_qty:.8f} px≈{s_px:.10f} "
-                            f"avg={pos['avg_price']:.10f} net_pnl=${pnl:.4f} -> reserve+${reserve_add:.4f}")
-                        del positions[pair]
-                    except Exception as e:
-                        log(f"[SELL ERROR] {pair}: {e}")
+                if not buy_signal(pair):
+                    log(f"[SKIP BUY] {pair} drop/momentum not satisfied (dip>={DIP_PERCENT}%, SMA breakout)")
+                    continue
+                # place buy
+                order = create_market_buy(pair, per_trade_usd)
+                if order:
+                    slots_left -= 1
 
-            # Buys (respect max positions & per-buy budget)
-            cash = usd_balance()
-            open_slots = max(0, MAX_OPEN_POSITIONS - len(positions))
-            if cash >= min( PER_BUY_USD, cash ) and open_slots > 0:
-                for pair in pairs:
-                    if pair in positions:
-                        continue
-                    if open_slots <= 0:
-                        break
-                    if not spread_ok(pair):
-                        continue
+        time.sleep(LOOP_DELAY)
 
-                    signal, cur_px = buy_signal(pair)
-                    if not signal:
-                        log(f"[SKIP BUY] {pair} no dip/momentum")
-                        continue
-
-                    # Ensure we meet min_cost and min_amount
-                    budget = min(PER_BUY_USD, cash)  # use defined per-trade or what's available
-                    if not can_afford_cost(pair, budget):
-                        # try to bump to min cost if cash allows
-                        need = max(budget, min_cost(pair) or budget)
-                        if cash >= need:
-                            budget = need
-                        else:
-                            log(f"[BUY SKIP] {pair} cash ${cash:.2f} < min_cost ${min_cost(pair):.2f}")
-                            continue
-
-                    try:
-                        order, b_qty, b_px = place_market_buy(pair, budget)
-                        # average in if already somehow present (rare during same loop)
-                        if pair in positions:
-                            old = positions[pair]
-                            new_qty = old["qty"] + b_qty
-                            new_avg = (old["avg_price"] * old["qty"] + b_px * b_qty) / new_qty
-                            positions[pair]["qty"] = new_qty
-                            positions[pair]["avg_price"] = new_avg
-                        else:
-                            positions[pair] = {"base": pair.split("/")[0], "qty": b_qty, "avg_price": b_px}
-                        open_slots -= 1
-                        log(f"[BUY] {pair} spent≈${budget:.2f} qty={b_qty:.8f} px≈{b_px:.10f}")
-                        cash -= budget  # reflect local budget (exchange balance will reflect real)
-                    except Exception as e:
-                        log(f"[BUY ERROR] {pair}: {e}")
-
-            time.sleep(LOOP_DELAY)
-
-        except Exception as e:
-            log(f"[ERROR] loop: {e}")
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    main()
+    except Exception as e:
+        log(f"[ERROR] main loop: {e}")
+        time.sleep(10)
